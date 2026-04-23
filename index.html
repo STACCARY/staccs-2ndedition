@@ -1,0 +1,1074 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#1747A5">
+<title>DECCBOX</title>
+<!--
+  LOCAL TESTING
+  Double-clicking this file WILL NOT WORK — browsers block loading the
+  GLB and PNGs from file:// due to CORS. In this folder, run:
+      python3 -m http.server 8000
+  then visit  http://localhost:8000
+  To test from your phone on the same WiFi, find your Mac's local IP
+  (Terminal: `ipconfig getifaddr en0`) and visit http://<ip>:8000 on the phone.
+  On Shopify (HTTPS) everything works automatically.
+-->
+<style>
+  /* ---------- Overlay (logo + badge) tuning ----------
+     All positioning, sizing and animation timing for the DOM-rendered SVGs
+     live here. The 3D scene at z=0 shows a frustum 5.6 world units tall,
+     which maps 1:1 to 100vh — so 1 world unit ≈ 17.86vh. Comments below
+     show the equivalent old world-space values for reference. */
+  :root {
+    --logo-width:           min(44vh, 95vw);   /* was LOGO_WIDTH_WORLD 2.5 (clamped to 95vw) */
+    --logo-top:             2vh;               /* was LOGO_TOP_MARGIN 0.5 */
+    --badge-width-rel:      30%;               /* was BADGE_WIDTH_WORLD 0.75 / logo 2.5 */
+    --badge-offset-x:      -1.78vh;            /* was BADGE_OFFSET_X 0.1 */
+    --badge-offset-y:      -1.78vh;            /* was BADGE_OFFSET_Y -0.1 */
+    --logo-fade-delay:      1.5s;
+    --logo-fade-duration:   1s;
+    --badge-delay:          2.5s;              /* = logo-fade-delay + logo-fade-duration */
+    --badge-scale-duration: 0.3s;
+    --badge-easing:         cubic-bezier(0.34, 1.8, 0.64, 1); /* overshoot for the pop-in */
+
+    /* (CTA buttons moved to the Shopify theme as a site-wide snippet —
+        see shopify/site-cta-buttons.liquid.) */
+  }
+
+  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:linear-gradient(180deg, #1747A5 0%, #3DAFEC 100%); }
+  #app { position:fixed; inset:0; }
+  #app canvas { display:block; width:100% !important; height:100% !important; touch-action:pan-y; }
+
+  #overlay { position:fixed; inset:0; pointer-events:none; z-index:5; }
+  #logo-wrap {
+    position:absolute;
+    left:50%;
+    top:var(--logo-top);
+    transform:translateX(-50%);
+    width:var(--logo-width);
+  }
+  #logo {
+    width:100%; height:auto; display:block;
+    opacity:0;
+    transition:opacity var(--logo-fade-duration) ease var(--logo-fade-delay);
+  }
+  #overlay.go #logo { opacity:1; }
+  #badge {
+    position:absolute;
+    right:var(--badge-offset-x);   /* negative pushes past the logo's right edge */
+    bottom:var(--badge-offset-y);  /* negative pushes past the logo's bottom edge */
+    width:var(--badge-width-rel);
+    height:auto;
+    transform:scale(0);
+    transform-origin:bottom left;
+    transition:transform var(--badge-scale-duration) var(--badge-easing) var(--badge-delay);
+  }
+  #overlay.go #badge { transform:scale(1); }
+
+  #loader {
+    position:fixed; inset:0;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    background: linear-gradient(180deg, #1747A5 0%, #3DAFEC 100%);
+    color:#fff; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    z-index:10; transition:opacity 0.2s ease;
+  }
+  #loader.hidden { opacity:0; pointer-events:none; }
+  #loader-frame {
+    width: min(180px, 35vmin);
+    height: auto;
+    display: block;
+    image-rendering: auto; /* switch to `pixelated` if the loader art should stay crisp */
+  }
+</style>
+</head>
+<body>
+<div id="loader">
+  <img id="loader-frame" src="assets/loader/loadprogress01.png" alt="">
+</div>
+<div id="app"></div>
+
+<div id="overlay">
+  <div id="logo-wrap">
+    <img id="logo" src="assets/staccs_logo.svg" alt="STACCS">
+    <img id="badge" src="assets/2nd_edition.svg" alt="2nd Edition — Coming Soon">
+  </div>
+  <!-- CTA buttons moved to Shopify theme — see shopify/site-cta-buttons.liquid -->
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---------- Config ----------
+  const SUITS = ['C', 'D', 'H', 'S'];
+  const VALUES = ['0', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'A', 'J', 'Q', 'K', 'W'];
+  const CARD_NAMES = [];
+  for (const s of SUITS) for (const v of VALUES) CARD_NAMES.push(s + v);
+
+  const IS_MOBILE = ('ontouchstart' in window || navigator.maxTouchPoints > 0) && window.innerWidth < 900;
+  const RAIN_COUNT = IS_MOBILE ? 9 : 15;
+  const INTRO_CARD_COUNT = 60;
+  const POOL_SIZE = INTRO_CARD_COUNT + RAIN_COUNT + 10;
+  const MOBILE_TEX_MAX = 256;
+
+  const CARD_RADIUS = 1.2;          // plane half-width → width 2.4 ≈ scaled-box width
+  const CARD_THICKNESS = 0.01;
+
+  const GRAVITY = 9.8;
+  const INTRO_BOX_DURATION = 0.6;
+  const INTRO_CARD_DELAY   = 0.2;   // seconds the card explosion waits after the box starts
+  const BOX_REST_DURATION = 2.0;
+  const RAIN_START_DELAY = 0.9;
+  const POSE_RESET_DURATION = 0.6; // seconds to animate back to rest pose
+
+  // Locked-in resting pose
+  const BOX_REST_ROT_X = 45;
+  const BOX_REST_ROT_Y = 140;
+  const BOX_REST_ROT_Z = 30;
+  const BOX_REST_SCALE_MUL = 1.5;
+  const BOX_Y_OFFSET = -0.25;     // world-Y translation after centering; negative = down
+
+  const BOX_AUTO_ROT_SPEED = 0.18;
+  const DRAG_SENSITIVITY = 0.008;
+  const SPIN_HALF_LIFE = 1.0;
+  const SPIN_TO_AUTO_CROSSOVER = 0.4;
+  const MAX_SPIN_VEL = 8;
+
+  const TAP_PULSE_DECAY = 0.3;
+  const TAP_PULSE_SCALE_AMP = 0.10;
+  const TAP_PULSE_EMISSIVE_AMP = 0.35;
+
+  const DOUBLE_TAP_WINDOW = 350; // ms between taps to count as double
+
+  // (CTA buttons + Shopify Forms trigger moved to the theme-level snippet
+  //  at shopify/site-cta-buttons.liquid so they persist across all pages.)
+
+  // Overlay (logo + badge) positioning and animation live in CSS variables at the
+  // top of the <style> block — no JS constants for them.
+
+  // ---------- Rain tuning ----------
+  // All the knobs for the card-rain density, depth, size, and speed.
+  const RAIN_FRONT_PROBABILITY = 0.05;  // fraction spawned in front of the box (0–1)
+  const RAIN_FAR_MIN          = -20;    // farthest Z behind the box (more negative = further back)
+  const RAIN_NEAR_MAX         = 2.5;    // nearest Z in front of the box (larger = closer to camera)
+  const RAIN_SCALE_MIN        = 0.70;   // smallest rain-card scale multiplier
+  const RAIN_SCALE_MAX        = 1.00;   // largest rain-card scale multiplier
+  const RAIN_FALL_SPEED_MIN   = 0.80;   // world units / sec
+  const RAIN_FALL_SPEED_MAX   = 1.80;
+  const RAIN_SPAWN_INTERVAL   = 0.35;   // seconds between spawns — larger = more staggered entry
+
+  const COLOR_TOP = new THREE.Color('#1747A5');
+  const COLOR_BOTTOM = new THREE.Color('#3DAFEC');
+
+  const WORLD_Y = new THREE.Vector3(0, 1, 0);
+  const WORLD_X = new THREE.Vector3(1, 0, 0);
+  const DEG = Math.PI / 180;
+
+  // ---------- Loader UI ----------
+  const loaderEl = document.getElementById('loader');
+  const loaderFrame = document.getElementById('loader-frame');
+
+  // Two animation sets:
+  //   • "progress" = loadprogress01..10.png. Driven by asset load %; 10 frames,
+  //     each covers 10% of progress. Never skips a frame (tickLoader advances
+  //     at most 1 per LOADER_PROGRESS_FRAME_MS).
+  //   • "outro"    = loader1..8.png. Plays once progress hits 100% and the
+  //     progress sequence has shown every frame. Immediately after frame 8
+  //     the loader hides and the 3D intro fires — no extra hold on frame 8.
+  const LOADER_PROGRESS_FRAME_MS = 50;  // min ms between progress-frame advances
+  const LOADER_OUTRO_FRAME_MS    = 40;  // ms between outro-frame advances
+  const LOADER_OUTRO_LAST_DWELL_MS = 25; // ms loader8 holds before hide fires
+
+  // Preload every frame so runtime src swaps are served from cache.
+  for (let i = 1; i <= 10; i++) {
+    const pre = new Image();
+    const n = i < 10 ? '0' + i : '' + i;
+    pre.src = 'assets/loader/loadprogress' + n + '.png';
+  }
+  for (let i = 1; i <= 8; i++) {
+    const pre = new Image();
+    pre.src = 'assets/loader/loader' + i + '.png';
+  }
+
+  let loaderPhase = 'progress';       // 'progress' | 'outro' | 'done'
+  let currentFrame = 1;
+  let targetFrame = 1;
+  let lastFrameAdvance = performance.now();
+  let loaderAnimDone = false;
+  let assetsFullyLoaded = false;
+  let assetsPayload = null;
+
+  function setLoaderFrame(phase, idx) {
+    let src;
+    if (phase === 'progress') {
+      const n = idx < 10 ? '0' + idx : '' + idx;
+      src = 'assets/loader/loadprogress' + n + '.png';
+    } else {
+      src = 'assets/loader/loader' + idx + '.png';
+    }
+    if (loaderFrame.src.indexOf(src) === -1) loaderFrame.src = src;
+  }
+
+  function setProgress(pct) {
+    const p = Math.max(0, Math.min(100, pct));
+    // 10 equal buckets across 0–100 → frames 1–10. 100% clamps to 10.
+    const t = Math.min(10, 1 + Math.floor(p / 10));
+    if (loaderPhase === 'progress' && t > targetFrame) targetFrame = t;
+    if (p >= 100) assetsFullyLoaded = true;
+  }
+
+  function tickLoader() {
+    const now = performance.now();
+
+    if (loaderPhase === 'progress') {
+      if (currentFrame < targetFrame) {
+        if (now - lastFrameAdvance >= LOADER_PROGRESS_FRAME_MS) {
+          currentFrame++;
+          lastFrameAdvance = now;
+          setLoaderFrame('progress', currentFrame);
+        }
+      } else if (currentFrame === 10 && assetsFullyLoaded) {
+        // Progress sequence complete AND assets fully loaded → start outro.
+        loaderPhase = 'outro';
+        currentFrame = 1;
+        setLoaderFrame('outro', 1);
+        lastFrameAdvance = now;
+      }
+    } else if (loaderPhase === 'outro') {
+      if (currentFrame < 8) {
+        if (now - lastFrameAdvance >= LOADER_OUTRO_FRAME_MS) {
+          currentFrame++;
+          lastFrameAdvance = now;
+          setLoaderFrame('outro', currentFrame);
+        }
+      } else {
+        // currentFrame === 8 — brief dwell (LOADER_OUTRO_LAST_DWELL_MS) so
+        // loader8 is clearly visible before the hide fires. One rAF tick
+        // alone (~16ms) was too quick to perceive.
+        if (now - lastFrameAdvance >= LOADER_OUTRO_LAST_DWELL_MS) {
+          loaderPhase = 'done';
+          loaderAnimDone = true;
+          maybeStartApp();
+          return;
+        }
+      }
+    }
+
+    if (loaderPhase !== 'done') requestAnimationFrame(tickLoader);
+  }
+  requestAnimationFrame(tickLoader);
+
+  function hideLoader() {
+    // Fade out (CSS transition on opacity) then remove from layout.
+    loaderEl.classList.add('hidden');
+    setTimeout(() => { loaderEl.style.display = 'none'; }, 300); // fade + small buffer
+  }
+
+  function maybeStartApp() {
+    if (assetsPayload && loaderAnimDone) {
+      // No extra hold — start the 3D intro at the same instant the loader
+      // begins its fade-out (they run in parallel, loader fades over 300ms).
+      hideLoader();
+      new App(assetsPayload);
+      assetsPayload = null;
+    }
+  }
+
+  // ---------- Asset loading ----------
+  function downscaleToCanvas(image, maxSize) {
+    const w = image.width, h = image.height;
+    const scale = Math.min(1, maxSize / Math.max(w, h));
+    if (scale >= 1) return image;
+    const cw = Math.max(1, Math.round(w * scale));
+    const ch = Math.max(1, Math.round(h * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = cw; canvas.height = ch;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(image, 0, 0, cw, ch);
+    return canvas;
+  }
+
+  function loadAssets(onProgress) {
+    const totalFiles = CARD_NAMES.length + 1 + 1 + 1 + 1; // fronts + back + glb + logo + badge
+    let loaded = 0;
+    const bump = () => { loaded++; onProgress((loaded / totalFiles) * 100); };
+
+    function loadTex(path) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => {
+          const source = IS_MOBILE ? downscaleToCanvas(img, MOBILE_TEX_MAX) : img;
+          const tex = new THREE.Texture(source);
+          tex.needsUpdate = true;
+          tex.encoding = THREE.sRGBEncoding;
+          tex.minFilter = THREE.LinearMipmapLinearFilter;
+          tex.magFilter = THREE.LinearFilter;
+          tex.generateMipmaps = true;
+          tex.anisotropy = 4;
+          bump();
+          resolve(tex);
+        };
+        img.onerror = () => reject(new Error('Failed to load ' + path));
+        img.src = path;
+      });
+    }
+
+    function preloadImage(path) {
+      // Kicks off the browser's native image load and resolves when ready.
+      // The result isn't kept — the matching <img> tag in the DOM will pull
+      // the same URL from the browser's cache. We only do this to gate the
+      // loader-progress bar on the SVG assets being available.
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => { bump(); resolve(); };
+        img.onerror = () => reject(new Error('Failed to load ' + path));
+        img.src = path;
+      });
+    }
+
+    const backP = loadTex('assets/cards/BACK.png');
+    const frontsP = Promise.all(CARD_NAMES.map(n => loadTex('assets/cards/' + n + '.png')));
+    const logoP = preloadImage('assets/staccs_logo.svg');
+    const badgeP = preloadImage('assets/2nd_edition.svg');
+    const glbP = new Promise((resolve, reject) => {
+      const loader = new THREE.GLTFLoader();
+      loader.load(
+        'assets/deccBox.glb',
+        (gltf) => { bump(); resolve(gltf); },
+        undefined,
+        (err) => reject(err)
+      );
+    });
+
+    return Promise.all([backP, frontsP, logoP, badgeP, glbP]).then(([backTex, frontTexArray, _logo, _badge, boxGltf]) => {
+      return { backTex, frontTexArray, boxGltf };
+    });
+  }
+
+  // ---------- Background gradient (breathing) ----------
+  function createBackground() {
+    const scene = new THREE.Scene();
+    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    const material = new THREE.ShaderMaterial({
+      uniforms: {
+        uTop:    { value: COLOR_TOP },
+        uBottom: { value: COLOR_BOTTOM },
+        uSplit:  { value: 0.5 }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = vec4(position, 1.0); }
+      `,
+      fragmentShader: `
+        uniform vec3 uTop;
+        uniform vec3 uBottom;
+        uniform float uSplit;
+        varying vec2 vUv;
+        void main() {
+          float t = smoothstep(uSplit - 0.5, uSplit + 0.5, vUv.y);
+          gl_FragColor = vec4(mix(uBottom, uTop, t), 1.0);
+        }
+      `,
+      depthTest: false, depthWrite: false
+    });
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+    scene.add(mesh);
+    return { scene, camera, material };
+  }
+
+  // ---------- Card geometry ----------
+  function createCardResources() {
+    const planeGeo = new THREE.PlaneGeometry(CARD_RADIUS * 2, CARD_RADIUS * 2);
+    return { planeGeo };
+  }
+
+  // ---------- Card pool ----------
+  class CardPool {
+    constructor(scene, res, backTex, fronts) {
+      this.scene = scene;
+      this.backTex = backTex;
+      this.fronts = fronts;
+      this.items = [];
+
+      backTex.center.set(0.5, 0.5);
+      backTex.rotation = Math.PI;
+
+      const sharedBackMat = new THREE.MeshLambertMaterial({
+        map: backTex, transparent: false, alphaTest: 0.5, side: THREE.FrontSide
+      });
+      const planeZOffset = CARD_THICKNESS * 0.5;
+
+      for (let i = 0; i < POOL_SIZE; i++) {
+        const group = new THREE.Group();
+
+        const frontMat = new THREE.MeshLambertMaterial({
+          map: fronts[i % fronts.length],
+          transparent: false, alphaTest: 0.5, side: THREE.FrontSide
+        });
+        const front = new THREE.Mesh(res.planeGeo, frontMat);
+        front.position.z = planeZOffset;
+        group.add(front);
+
+        const back = new THREE.Mesh(res.planeGeo, sharedBackMat);
+        back.position.z = -planeZOffset;
+        back.rotation.x = Math.PI;
+        group.add(back);
+
+        group.visible = false;
+        scene.add(group);
+
+        this.items.push({
+          group,
+          frontMat,
+          vel: new THREE.Vector3(),
+          angVel: new THREE.Vector3(),
+          state: 'idle'
+        });
+      }
+    }
+    acquire(state) {
+      for (const it of this.items) {
+        if (it.state === 'idle') {
+          const idx = Math.floor(Math.random() * this.fronts.length);
+          it.frontMat.map = this.fronts[idx];
+          it.frontMat.needsUpdate = true;
+          it.state = state;
+          it.group.visible = true;
+          return it;
+        }
+      }
+      return null;
+    }
+    release(it) {
+      it.state = 'idle';
+      it.group.visible = false;
+      it.vel.set(0, 0, 0);
+      it.angVel.set(0, 0, 0);
+      it.group.scale.setScalar(1);
+    }
+    countByState(state) {
+      let n = 0;
+      for (const it of this.items) if (it.state === state) n++;
+      return n;
+    }
+    all() { return this.items; }
+  }
+
+  // ---------- Helpers ----------
+  function fibSphere(n) {
+    const pts = [];
+    const phi = Math.PI * (3 - Math.sqrt(5));
+    for (let i = 0; i < n; i++) {
+      const y = 1 - (i / Math.max(n - 1, 1)) * 2;
+      const r = Math.sqrt(Math.max(0, 1 - y * y));
+      const theta = phi * i;
+      pts.push(new THREE.Vector3(Math.cos(theta) * r, y, Math.sin(theta) * r));
+    }
+    return pts;
+  }
+
+  function pointerXY(ev) {
+    if (ev.touches && ev.touches[0]) return { x: ev.touches[0].clientX, y: ev.touches[0].clientY };
+    if (ev.changedTouches && ev.changedTouches[0]) return { x: ev.changedTouches[0].clientX, y: ev.changedTouches[0].clientY };
+    return { x: ev.clientX, y: ev.clientY };
+  }
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  // ---------- App ----------
+  class App {
+    constructor(assets) {
+      this.assets = assets;
+      this.container = document.getElementById('app');
+      this.clock = new THREE.Clock();
+      this.elapsed = 0;
+
+      this.dragging = false;
+      this.spinVelY = 0;
+      this.spinVelX = 0;
+
+      this.tapPulse = 0;
+
+      // Pose reset animation state
+      this.poseResetStart = null;
+      this.poseResetFrom = new THREE.Quaternion();
+      this.poseResetTo = new THREE.Quaternion();
+
+      this.lastOutsideTapTime = 0;
+
+      this.initRenderer();
+      this.initScene();
+      this.bg = createBackground();
+      this.initLights();
+      this.initBox();
+      this.initCards();
+      this.initInteraction();
+      this.initResize();
+
+      this.rainTimer = 0;
+      this.rainSpawnCooldown = 0;
+      this.startIntro();
+
+      this.loop = this.loop.bind(this);
+      // Run the first frame synchronously so the canvas has the gradient
+      // painted before the browser paints. Without this, the default black
+      // clear color flashes for ~16ms between the loader snapping off and
+      // the first rAF-scheduled render. loop() schedules the next rAF itself.
+      this.loop();
+    }
+
+    initRenderer() {
+      const r = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+      r.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      r.outputEncoding = THREE.sRGBEncoding;
+      r.autoClear = false;
+      this.container.appendChild(r.domElement);
+      this.renderer = r;
+    }
+
+    initScene() {
+      this.scene = new THREE.Scene();
+      this.camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+      this.camera.position.set(0, 0.4, 6);
+      this.camera.lookAt(0, 0, 0);
+    }
+
+    initLights() {
+      this.scene.add(new THREE.AmbientLight(0xffffff, 0.25));
+      const key = new THREE.DirectionalLight(0xffffff, 0.9);
+      key.position.set(3, 4, 5);
+      this.scene.add(key);
+      const rim = new THREE.DirectionalLight(0x88bbff, 0.7);
+      rim.position.set(-2, 2, -4);
+      this.scene.add(rim);
+    }
+
+    initBox() {
+      const root = this.assets.boxGltf.scene;
+      const bbox = new THREE.Box3().setFromObject(root);
+      const size = bbox.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z) || 1;
+      const baseTargetSize = 1.6;
+      const s = (baseTargetSize / maxDim) * BOX_REST_SCALE_MUL;
+      root.scale.setScalar(s);
+      const bbox2 = new THREE.Box3().setFromObject(root);
+      const center = bbox2.getCenter(new THREE.Vector3());
+      root.position.sub(center);
+      root.position.y += BOX_Y_OFFSET;
+
+      // Rest-pose quaternion (reused for reset animations)
+      this.restQuaternion = new THREE.Quaternion().setFromEuler(new THREE.Euler(
+        BOX_REST_ROT_X * DEG,
+        BOX_REST_ROT_Y * DEG,
+        BOX_REST_ROT_Z * DEG,
+        'XYZ'
+      ));
+
+      // Random starting orientation for the intro. Box slerps from this to
+      // restQuaternion over INTRO_BOX_DURATION, using the same ease curve as
+      // the scale tween so rotation and scale "marry up" at the same instant.
+      this.boxIntroFromQ = new THREE.Quaternion().setFromEuler(new THREE.Euler(
+        (Math.random() - 0.5) * Math.PI * 2,
+        (Math.random() - 0.5) * Math.PI * 2,
+        (Math.random() - 0.5) * Math.PI * 2,
+        'XYZ'
+      ));
+      root.quaternion.copy(this.boxIntroFromQ);
+      this._introRotDone = false;
+
+      // Measure actual world-space Z extent of the box *in its rest pose* so the
+      // rain deadzone adapts to whatever scale + rotation we ended up with.
+      const restBbox = new THREE.Box3().setFromObject(root);
+      const boxZHalf = Math.max(Math.abs(restBbox.min.z), Math.abs(restBbox.max.z));
+      this.deadzoneZ = boxZHalf + 0.6; // + small buffer; edge-on card clipping during tumble is accepted
+
+      this.boxTargetScale = s;
+      root.scale.setScalar(0);
+      this.box = root;
+      this.scene.add(root);
+      this.boxIntroStart = null;
+
+      // Cache original emissive colors for the brightness pulse.
+      this.pulseMaterials = [];
+      root.traverse((o) => {
+        if (o.isMesh && o.material) {
+          const mats = Array.isArray(o.material) ? o.material : [o.material];
+          for (const m of mats) {
+            if (m.emissive && !m._origEmissive) {
+              m._origEmissive = m.emissive.clone();
+              this.pulseMaterials.push(m);
+            }
+          }
+        }
+      });
+    }
+
+    initCards() {
+      const res = createCardResources();
+      this.cardPool = new CardPool(this.scene, res, this.assets.backTex, this.assets.frontTexArray);
+      this._tmpV = new THREE.Vector3();
+      this._tmpQ = new THREE.Quaternion();
+      this._tmpQ2 = new THREE.Quaternion();
+      this._worldPos = new THREE.Vector3();
+      this._ndc = new THREE.Vector3();
+    }
+
+    triggerOverlay() {
+      // One-shot: flips the DOM overlay from hidden → visible state. CSS
+      // transitions on the logo/badge/buttons use their own delays/durations
+      // from the :root custom properties — we just add the `.go` class to
+      // #overlay so everything underneath (logo-wrap + btn-wrap) cascades.
+      if (this._overlayTriggered) return;
+      const overlay = document.getElementById('overlay');
+      if (!overlay) return;
+      overlay.classList.add('go');
+      this._overlayTriggered = true;
+    }
+
+    initInteraction() {
+      const dom = this.renderer.domElement;
+      this.raycaster = new THREE.Raycaster();
+
+      this._dragStart = null;
+      this._lastPt = null;
+      this._pointerSamples = [];
+      this._bgTapStart = null;
+      this._gestureMode = null; // 'box' | 'bg' | null
+
+      const detach = () => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('pointercancel', onCancel);
+      };
+
+      const onDown = (ev) => {
+        const p = pointerXY(ev);
+        const now = performance.now();
+
+        // Raycast at pointerdown to decide whether to capture this gesture
+        // for rotation or to let the browser handle it (e.g., page scroll).
+        const hitBox = this.raycastBoxAt(p.x, p.y);
+
+        // Any new interaction cancels an in-progress pose reset
+        this.poseResetStart = null;
+
+        if (hitBox) {
+          ev.preventDefault(); // capture gesture — no scroll/default action
+          this._gestureMode = 'box';
+          this.dragging = true;
+          this._dragStart = { x: p.x, y: p.y, t: now };
+          this._lastPt = { x: p.x, y: p.y };
+          this._pointerSamples = [{ x: p.x, y: p.y, t: now }];
+          this.spinVelY = 0;
+          this.spinVelX = 0;
+        } else {
+          // Don't preventDefault → browser handles native pan-y scroll.
+          // Just track start point so we can still recognize a short tap
+          // outside the box (for the double-tap pose reset).
+          this._gestureMode = 'bg';
+          this._bgTapStart = { x: p.x, y: p.y, t: now };
+        }
+
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
+        window.addEventListener('pointercancel', onCancel);
+      };
+
+      const onMove = (ev) => {
+        if (this._gestureMode !== 'box' || !this.dragging) return;
+        const p = pointerXY(ev);
+        const dx = p.x - this._lastPt.x;
+        const dy = p.y - this._lastPt.y;
+        this._lastPt = { x: p.x, y: p.y };
+
+        this.box.rotateOnWorldAxis(WORLD_Y, dx * DRAG_SENSITIVITY);
+        this.box.rotateOnWorldAxis(WORLD_X, dy * DRAG_SENSITIVITY);
+
+        const now = performance.now();
+        this._pointerSamples.push({ x: p.x, y: p.y, t: now });
+        while (this._pointerSamples.length > 1 && now - this._pointerSamples[0].t > 100) {
+          this._pointerSamples.shift();
+        }
+      };
+
+      const onUp = (ev) => {
+        const mode = this._gestureMode;
+        this._gestureMode = null;
+        detach();
+        const p = pointerXY(ev);
+
+        if (mode === 'box') {
+          this.dragging = false;
+          const dx = p.x - this._dragStart.x;
+          const dy = p.y - this._dragStart.y;
+          const dt = performance.now() - this._dragStart.t;
+
+          if (Math.hypot(dx, dy) < 8 && dt < 350) {
+            // Tap on the box — shoot a card. Clear any pending outside-tap tracker.
+            this.shootCard();
+            this.lastOutsideTapTime = 0;
+            return;
+          }
+
+          // Spin momentum from drag release
+          const samples = this._pointerSamples;
+          if (samples.length >= 2) {
+            const first = samples[0], last = samples[samples.length - 1];
+            const sdt = Math.max((last.t - first.t) / 1000, 0.016);
+            const vxPx = (last.x - first.x) / sdt;
+            const vyPx = (last.y - first.y) / sdt;
+            this.spinVelY = clamp(vxPx * DRAG_SENSITIVITY, -MAX_SPIN_VEL, MAX_SPIN_VEL);
+            this.spinVelX = clamp(vyPx * DRAG_SENSITIVITY, -MAX_SPIN_VEL, MAX_SPIN_VEL);
+          }
+        } else if (mode === 'bg') {
+          const start = this._bgTapStart;
+          this._bgTapStart = null;
+          if (!start) return;
+          const dx = p.x - start.x;
+          const dy = p.y - start.y;
+          const dt = performance.now() - start.t;
+          // Only a short, nearly-stationary release counts as a tap —
+          // scrolls come through as pointercancel, not pointerup with movement.
+          if (Math.hypot(dx, dy) < 8 && dt < 350) {
+            const now2 = performance.now();
+            if (now2 - this.lastOutsideTapTime < DOUBLE_TAP_WINDOW) {
+              this.resetBoxPose();
+              this.lastOutsideTapTime = 0;
+            } else {
+              this.lastOutsideTapTime = now2;
+            }
+          }
+        }
+      };
+
+      const onCancel = (ev) => {
+        // Browser took over the gesture (e.g., page scroll). Drop all tracker state.
+        this._gestureMode = null;
+        this.dragging = false;
+        this._bgTapStart = null;
+        detach();
+      };
+
+      dom.addEventListener('pointerdown', onDown);
+      dom.addEventListener('dblclick', (ev) => ev.preventDefault());
+    }
+
+    raycastBoxAt(x, y) {
+      const rect = this.renderer.domElement.getBoundingClientRect();
+      const ndc = new THREE.Vector2(
+        ((x - rect.left) / rect.width) * 2 - 1,
+        -((y - rect.top) / rect.height) * 2 + 1
+      );
+      this.raycaster.setFromCamera(ndc, this.camera);
+      const targets = [];
+      this.box.traverse((o) => { if (o.isMesh) targets.push(o); });
+      return this.raycaster.intersectObjects(targets, false).length > 0;
+    }
+
+    resetBoxPose() {
+      this.poseResetStart = performance.now() / 1000;
+      this.poseResetFrom.copy(this.box.quaternion);
+      this.poseResetTo.copy(this.restQuaternion);
+      this.spinVelY = 0;
+      this.spinVelX = 0;
+    }
+
+    shootCard() {
+      const card = this.cardPool.acquire('shot');
+      if (!card) return;
+      this.box.getWorldPosition(this._worldPos);
+      card.group.position.copy(this._worldPos);
+      card.group.rotation.set(Math.random() * Math.PI * 2, Math.random() * Math.PI * 2, Math.random() * Math.PI * 2);
+      card.group.scale.setScalar(1);
+
+      const camToBox = new THREE.Vector3().subVectors(this._worldPos, this.camera.position).normalize();
+      const baseDir = new THREE.Vector3(0, 1, 0).addScaledVector(camToBox.clone().negate(), 0.7).normalize();
+      const coneR = 30 * Math.PI / 180;
+      baseDir
+        .applyAxisAngle(WORLD_X, (Math.random() - 0.5) * coneR * 2)
+        .applyAxisAngle(WORLD_Y, (Math.random() - 0.5) * coneR * 2)
+        .normalize();
+      const speed = 7 + Math.random() * 4;
+      card.vel.copy(baseDir).multiplyScalar(speed);
+      card.angVel.set(
+        (Math.random() - 0.5) * 10,
+        (Math.random() - 0.5) * 10,
+        (Math.random() - 0.5) * 10
+      );
+
+      this.tapPulse = 1.0;
+    }
+
+    initResize() {
+      const obs = new ResizeObserver(() => this.resize());
+      obs.observe(this.container);
+      window.addEventListener('orientationchange', () => setTimeout(() => this.resize(), 100));
+      this.resize();
+    }
+
+    resize() {
+      const w = this.container.clientWidth || window.innerWidth;
+      const h = this.container.clientHeight || window.innerHeight;
+      if (w < 2 || h < 2) return;
+      this.renderer.setSize(w, h);
+      this.camera.aspect = w / h;
+      this.camera.updateProjectionMatrix();
+    }
+
+    startIntro() {
+      this.boxIntroStart = performance.now() / 1000;
+      this.triggerOverlay();
+      const dirs = fibSphere(INTRO_CARD_COUNT);
+      for (let i = 0; i < INTRO_CARD_COUNT; i++) {
+        const card = this.cardPool.acquire('intro');
+        if (!card) break;
+        this.box.getWorldPosition(this._worldPos);
+        card.group.position.copy(this._worldPos);
+        card.group.rotation.set(
+          Math.random() * Math.PI * 2,
+          Math.random() * Math.PI * 2,
+          Math.random() * Math.PI * 2
+        );
+        card.group.scale.setScalar(0); // grows with the box during intro
+        const dir = dirs[i].clone();
+        dir.x += (Math.random() - 0.5) * 0.1;
+        dir.y += (Math.random() - 0.5) * 0.1;
+        dir.z += (Math.random() - 0.5) * 0.1;
+        dir.normalize();
+        dir.y += 0.35;
+        dir.normalize();
+        const speed = 6 + Math.random() * 6;
+        card.vel.copy(dir).multiplyScalar(speed);
+        card.angVel.set(
+          (Math.random() - 0.5) * 8,
+          (Math.random() - 0.5) * 8,
+          (Math.random() - 0.5) * 8
+        );
+      }
+      this.rainTimer = 0;
+    }
+
+    spawnRainCard() {
+      const card = this.cardPool.acquire('rain');
+      if (!card) return;
+
+      // Pick which side of the box this card falls on, using a fixed probability
+      // (decoupled from the range sizes so you can tune density independently of depth).
+      const FAR_MAX = -this.deadzoneZ;
+      const NEAR_MIN = this.deadzoneZ;
+      const inFront = Math.random() < RAIN_FRONT_PROBABILITY;
+      const z = inFront
+        ? NEAR_MIN + Math.random() * Math.max(RAIN_NEAR_MAX - NEAR_MIN, 0.1)
+        : RAIN_FAR_MIN + Math.random() * Math.max(FAR_MAX - RAIN_FAR_MIN, 0.1);
+
+      const scale = RAIN_SCALE_MIN + Math.random() * (RAIN_SCALE_MAX - RAIN_SCALE_MIN);
+      card.group.scale.setScalar(scale);
+
+      const camDist = this.camera.position.z - z;
+      const halfHAtZ = Math.tan((this.camera.fov * Math.PI / 180) / 2) * camDist;
+      const halfWAtZ = halfHAtZ * this.camera.aspect;
+
+      const margin = CARD_RADIUS * scale * 1.1 + 0.3 + Math.random() * 1.2;
+      const spawnY = halfHAtZ + margin;
+
+      card.group.position.set(
+        (Math.random() - 0.5) * halfWAtZ * 2,
+        spawnY,
+        z
+      );
+      card.group.rotation.set(
+        Math.random() * Math.PI * 2,
+        Math.random() * Math.PI * 2,
+        Math.random() * Math.PI * 2
+      );
+      const fallSpeed = RAIN_FALL_SPEED_MIN + Math.random() * (RAIN_FALL_SPEED_MAX - RAIN_FALL_SPEED_MIN);
+      card.vel.set(
+        (Math.random() - 0.5) * 0.15,
+        -fallSpeed,
+        (Math.random() - 0.5) * 0.08
+      );
+      card.angVel.set(
+        (Math.random() - 0.5) * 0.6,
+        (Math.random() - 0.5) * 0.6,
+        (Math.random() - 0.5) * 0.6
+      );
+    }
+
+    applyEmissivePulse() {
+      if (!this.pulseMaterials.length) return;
+      const boost = TAP_PULSE_EMISSIVE_AMP * this.tapPulse;
+      for (const m of this.pulseMaterials) {
+        m.emissive.copy(m._origEmissive).addScalar(boost);
+      }
+    }
+
+    updateBox(dt) {
+      const now = performance.now() / 1000;
+
+      this.tapPulse = Math.max(0, this.tapPulse - dt / TAP_PULSE_DECAY);
+      this.applyEmissivePulse();
+      const pulseScaleMul = 1 + TAP_PULSE_SCALE_AMP * this.tapPulse;
+
+      // Pose reset animation takes over rotation + scale
+      if (this.poseResetStart !== null) {
+        const rt = Math.min((now - this.poseResetStart) / POSE_RESET_DURATION, 1);
+        const rk = 1 - Math.pow(1 - rt, 3);
+        THREE.Quaternion.slerp(this.poseResetFrom, this.poseResetTo, this._tmpQ, rk);
+        this.box.quaternion.copy(this._tmpQ);
+        this.box.scale.setScalar(this.boxTargetScale * pulseScaleMul);
+        if (rt >= 1) {
+          this.poseResetStart = null;
+          // Restart the rest window so the box pauses before auto-rotating again
+          this.boxIntroStart = now - INTRO_BOX_DURATION;
+        }
+        return;
+      }
+
+      // Intro scale tween (smoothstep S-curve)
+      const t = Math.min((now - this.boxIntroStart) / INTRO_BOX_DURATION, 1);
+      const k = t * t * (3 - 2 * t);
+      this.box.scale.setScalar(this.boxTargetScale * k * pulseScaleMul);
+
+      // Intro rotation: slerp from the random start pose to restQuaternion
+      // using the same ease curve. Runs only during the scale-up, then locks.
+      if (!this._introRotDone) {
+        if (t < 1) {
+          this.box.quaternion.slerpQuaternions(this.boxIntroFromQ, this.restQuaternion, k);
+        } else {
+          this.box.quaternion.copy(this.restQuaternion);
+          this._introRotDone = true;
+        }
+      }
+
+      if (this.dragging) return;
+
+      this.box.rotateOnWorldAxis(WORLD_Y, this.spinVelY * dt);
+      this.box.rotateOnWorldAxis(WORLD_X, this.spinVelX * dt);
+
+      const decay = Math.pow(0.5, dt / SPIN_HALF_LIFE);
+      this.spinVelY *= decay;
+      this.spinVelX *= decay;
+
+      const timeSinceIntro = now - this.boxIntroStart;
+      if (timeSinceIntro < INTRO_BOX_DURATION + BOX_REST_DURATION) return;
+
+      const spinMag = Math.abs(this.spinVelY) + Math.abs(this.spinVelX);
+      const autoInfluence = Math.max(0, 1 - spinMag / SPIN_TO_AUTO_CROSSOVER);
+      this.box.rotateOnWorldAxis(WORLD_Y, BOX_AUTO_ROT_SPEED * autoInfluence * dt);
+    }
+
+    updateCards(dt) {
+      // Intro scale — intro-state cards grow alongside the box using the same
+      // ease-out-cubic curve, offset by INTRO_CARD_DELAY so the box gets a
+      // head start. Before that delay elapses, intro cards stay at origin
+      // (no physics, scale 0) so they don't "materialize" mid-flight later.
+      let introK = 0;
+      let cardsLaunched = true;
+      if (this.boxIntroStart !== null) {
+        const cardsStart = this.boxIntroStart + INTRO_CARD_DELAY;
+        const nowS = performance.now() / 1000;
+        cardsLaunched = nowS >= cardsStart;
+        const tIntro = Math.min(Math.max((nowS - cardsStart) / INTRO_BOX_DURATION, 0), 1);
+        introK = tIntro * tIntro * (3 - 2 * tIntro);
+      }
+
+      for (const it of this.cardPool.all()) {
+        if (it.state === 'idle') continue;
+
+        if (it.state === 'intro') {
+          it.group.scale.setScalar(introK);
+          // Freeze at origin until the delay has passed, then run physics.
+          if (!cardsLaunched) continue;
+        }
+
+        it.group.position.addScaledVector(it.vel, dt);
+
+        if (it.state !== 'rain') {
+          it.vel.y -= GRAVITY * dt;
+        }
+
+        const angle = it.angVel.length() * dt;
+        if (angle > 0.0001) {
+          this._tmpV.copy(it.angVel).normalize();
+          this._tmpQ.setFromAxisAngle(this._tmpV, angle);
+          it.group.quaternion.premultiply(this._tmpQ);
+        }
+
+        this._ndc.copy(it.group.position).project(this.camera);
+
+        // How far the card extends past its center in NDC Y at the card's current Z.
+        // Using the plane's full diagonal (× ~sqrt(2)) as a worst-case since the card
+        // is tumbling and its visible Y-extent changes with orientation.
+        const sc = it.group.scale.x;
+        const worldExtent = CARD_RADIUS * sc * 1.42;
+        const camDistZ = Math.max(0.5, this.camera.position.z - it.group.position.z);
+        const halfHAtZ = Math.tan(this.camera.fov * DEG / 2) * camDistZ;
+        const ndcExtentY = worldExtent / halfHAtZ;
+        // Release only when the TOP edge of the card has dropped past the screen bottom
+        const releaseY = -1.0 - ndcExtentY - 0.05;
+
+        if (it.state === 'rain') {
+          if (this._ndc.y < releaseY || it.group.position.y < -30) {
+            this.cardPool.release(it);
+          }
+        } else {
+          const releaseX = 1.0 + ndcExtentY + 0.05;
+          if (this._ndc.y < releaseY || Math.abs(this._ndc.x) > releaseX || it.group.position.y < -40) {
+            this.cardPool.release(it);
+          }
+        }
+      }
+    }
+
+    maintainRain(dt) {
+      this.rainTimer += dt;
+      if (this.rainTimer < RAIN_START_DELAY) return;
+      this.rainSpawnCooldown -= dt;
+      const current = this.cardPool.countByState('rain');
+      if (current < RAIN_COUNT && this.rainSpawnCooldown <= 0) {
+        this.spawnRainCard();
+        // Single steady cadence — no burst ramp — so cards enter the scene
+        // spread across the screen height instead of all clustered at the top.
+        this.rainSpawnCooldown = RAIN_SPAWN_INTERVAL;
+      }
+    }
+
+    loop() {
+      requestAnimationFrame(this.loop);
+      const dt = Math.min(this.clock.getDelta(), 0.05);
+      this.elapsed += dt;
+
+      this.bg.material.uniforms.uSplit.value = 0.5 + 0.1 * Math.sin(this.elapsed * 0.25);
+
+      if (this.box) this.updateBox(dt);
+      this.updateCards(dt);
+      this.maintainRain(dt);
+
+      this.renderer.clear();
+      this.renderer.render(this.bg.scene, this.bg.camera);
+      this.renderer.clearDepth();
+      this.renderer.render(this.scene, this.camera);
+    }
+  }
+
+  // ---------- Bootstrap ----------
+  loadAssets((pct) => setProgress(pct))
+    .then((assets) => {
+      setProgress(100);       // sets targetFrame = 8
+      assetsPayload = assets; // tickLoader will hand off to maybeStartApp when the animation catches up
+      maybeStartApp();        // also handle the race where animation already reached 8 first
+    })
+    .catch((err) => {
+      console.error('Asset load failed:', err);
+    });
+
+})();
+</script>
+</body>
+</html>
