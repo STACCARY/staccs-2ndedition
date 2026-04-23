@@ -705,12 +705,25 @@
           // Pass-through vertical drag to the parent page as a scroll.
           // Sign convention: finger up (p.y decreases) → scrollBy positive (page
           // scrolls down, content moves up) — mirrors native touch scrolling.
+          // Accumulate deltas and post once per rAF to avoid flooding parent
+          // with per-move messages, which caused visible scroll jitter.
           const scrollDy = this._lastPt.y - p.y;
           this._lastPt = { x: p.x, y: p.y };
           if (scrollDy !== 0 && window.parent && window.parent !== window) {
-            try {
-              window.parent.postMessage({ type: 'staccs-scroll', dy: scrollDy }, '*');
-            } catch (e) {}
+            this._pendingScrollDy = (this._pendingScrollDy || 0) + scrollDy;
+            if (!this._scrollRafScheduled) {
+              this._scrollRafScheduled = true;
+              requestAnimationFrame(() => {
+                this._scrollRafScheduled = false;
+                const dy = this._pendingScrollDy;
+                this._pendingScrollDy = 0;
+                if (dy !== 0) {
+                  try {
+                    window.parent.postMessage({ type: 'staccs-scroll', dy: dy }, '*');
+                  } catch (e) {}
+                }
+              });
+            }
           }
         }
       };
