@@ -144,6 +144,7 @@
   const TAP_PULSE_EMISSIVE_AMP = 0.35;
 
   const DOUBLE_TAP_WINDOW = 350; // ms between taps to count as double
+  const BOX_HIT_EXPANSION = 1.3; // raycast miss → fall back to circle this much larger than box bounding sphere
 
   // (CTA buttons + Shopify Forms trigger moved to the theme-level snippet
   //  at shopify/site-cta-buttons.liquid so they persist across all pages.)
@@ -588,6 +589,12 @@
       const boxZHalf = Math.max(Math.abs(restBbox.min.z), Math.abs(restBbox.max.z));
       this.deadzoneZ = boxZHalf + 0.6; // + small buffer; edge-on card clipping during tumble is accepted
 
+      // Bounding sphere radius used for the generous "hit a fat-finger touch
+      // even if the mesh raycast misses" fallback in raycastBoxAt.
+      const hitSphere = new THREE.Sphere();
+      restBbox.getBoundingSphere(hitSphere);
+      this._boxHitRadius = hitSphere.radius;
+
       this.boxTargetScale = s;
       root.scale.setScalar(0);
       this.box = root;
@@ -761,14 +768,30 @@
 
     raycastBoxAt(x, y) {
       const rect = this.renderer.domElement.getBoundingClientRect();
-      const ndc = new THREE.Vector2(
-        ((x - rect.left) / rect.width) * 2 - 1,
-        -((y - rect.top) / rect.height) * 2 + 1
-      );
-      this.raycaster.setFromCamera(ndc, this.camera);
+      const ndcX = ((x - rect.left) / rect.width) * 2 - 1;
+      const ndcY = -((y - rect.top) / rect.height) * 2 + 1;
+
+      // Primary: real mesh raycast against the box's geometry.
+      this.raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this.camera);
       const targets = [];
       this.box.traverse((o) => { if (o.isMesh) targets.push(o); });
-      return this.raycaster.intersectObjects(targets, false).length > 0;
+      if (this.raycaster.intersectObjects(targets, false).length > 0) return true;
+
+      // Fallback: fat-finger-forgiving circle around the box's projected
+      // center. A hex silhouette has corners a fingertip can visually overlap
+      // but raycast through — this treats those as hits too. The circle is
+      // sized from the box's world-space bounding sphere, then inflated.
+      const boxCenter = this._worldPos;
+      this.box.getWorldPosition(boxCenter);
+      const centerNdc = new THREE.Vector3().copy(boxCenter).project(this.camera);
+      const edgeNdc = new THREE.Vector3(
+        boxCenter.x + this._boxHitRadius,
+        boxCenter.y,
+        boxCenter.z
+      ).project(this.camera);
+      const ndcRadius = Math.abs(edgeNdc.x - centerNdc.x) * BOX_HIT_EXPANSION;
+      const dist = Math.hypot(ndcX - centerNdc.x, ndcY - centerNdc.y);
+      return dist < ndcRadius;
     }
 
     resetBoxPose() {
