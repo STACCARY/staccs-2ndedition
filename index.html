@@ -39,7 +39,7 @@
 
   html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:linear-gradient(180deg, #1747A5 0%, #3DAFEC 100%); }
   #app { position:fixed; inset:0; }
-  #app canvas { display:block; width:100% !important; height:100% !important; touch-action:pan-y; }
+  #app canvas { display:block; width:100% !important; height:100% !important; touch-action:none; }
 
   #overlay { position:fixed; inset:0; pointer-events:none; z-index:5; }
   #logo-wrap {
@@ -675,11 +675,13 @@
           this.spinVelY = 0;
           this.spinVelX = 0;
         } else {
-          // Don't preventDefault → browser handles native pan-y scroll.
-          // Just track start point so we can still recognize a short tap
-          // outside the box (for the double-tap pose reset).
+          // Capture the gesture and proxy vertical drags to the parent page
+          // via postMessage (the iframe itself has no scrollable content).
+          // Tap detection still runs on pointerup.
+          ev.preventDefault();
           this._gestureMode = 'bg';
           this._bgTapStart = { x: p.x, y: p.y, t: now };
+          this._lastPt = { x: p.x, y: p.y };
         }
 
         window.addEventListener('pointermove', onMove);
@@ -688,19 +690,35 @@
       };
 
       const onMove = (ev) => {
-        if (this._gestureMode !== 'box' || !this.dragging) return;
         const p = pointerXY(ev);
-        const dx = p.x - this._lastPt.x;
-        const dy = p.y - this._lastPt.y;
-        this._lastPt = { x: p.x, y: p.y };
 
-        this.box.rotateOnWorldAxis(WORLD_Y, dx * DRAG_SENSITIVITY);
-        this.box.rotateOnWorldAxis(WORLD_X, dy * DRAG_SENSITIVITY);
+        if (this._gestureMode === 'box' && this.dragging) {
+          const dx = p.x - this._lastPt.x;
+          const dy = p.y - this._lastPt.y;
+          this._lastPt = { x: p.x, y: p.y };
 
-        const now = performance.now();
-        this._pointerSamples.push({ x: p.x, y: p.y, t: now });
-        while (this._pointerSamples.length > 1 && now - this._pointerSamples[0].t > 100) {
-          this._pointerSamples.shift();
+          this.box.rotateOnWorldAxis(WORLD_Y, dx * DRAG_SENSITIVITY);
+          this.box.rotateOnWorldAxis(WORLD_X, dy * DRAG_SENSITIVITY);
+
+          const now = performance.now();
+          this._pointerSamples.push({ x: p.x, y: p.y, t: now });
+          while (this._pointerSamples.length > 1 && now - this._pointerSamples[0].t > 100) {
+            this._pointerSamples.shift();
+          }
+          return;
+        }
+
+        if (this._gestureMode === 'bg' && this._lastPt) {
+          // Pass-through vertical drag to the parent page as a scroll.
+          // Sign convention: finger up (p.y decreases) → scrollBy positive (page
+          // scrolls down, content moves up) — mirrors native touch scrolling.
+          const scrollDy = this._lastPt.y - p.y;
+          this._lastPt = { x: p.x, y: p.y };
+          if (scrollDy !== 0 && window.parent && window.parent !== window) {
+            try {
+              window.parent.postMessage({ type: 'staccs-scroll', dy: scrollDy }, '*');
+            } catch (e) {}
+          }
         }
       };
 
